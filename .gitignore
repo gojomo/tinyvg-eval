@@ -1,0 +1,18 @@
+# Intermediate/generated files (trivially recreatable from scripts)
+*.tvgt
+*.tvg
+*.tvg.zst
+*.tvg.br
+*.tvg.zstd
+*.tga
+*.png
+
+# Node modules
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
