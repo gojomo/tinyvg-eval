@@ -2,7 +2,7 @@
 """
 convert_and_analyze.py - Full pipeline for TinyVG compression analysis.
 
-For each SVG in the benchmark datasets:
+For each SVG in all datasets (original benchmark + extended icon sets):
   1. Optimize with SVGO (matching TinyVG benchmark settings)
   2. Convert SVG -> TVGT (text) -> TVG (binary)
   3. Compress .tvg with zstd --ultra -22, brotli -q 11
@@ -12,7 +12,6 @@ For each SVG in the benchmark datasets:
 Produces:
   - results/compression_data.csv   (per-file raw data)
   - results/tvg_dict.zstd          (trained zstd dictionary)
-  - results/report.md              (human-readable summary)
 """
 
 import csv
@@ -37,6 +36,10 @@ SVGO_CONFIG = str(Path(__file__).resolve().parent / "svgo.config.js")
 TVG_TEXT_BIN = str(SDK_DIR / "zig-out" / "bin" / "tvg-text")
 SVG2TVGT_DLL = str(SDK_DIR / "src" / "tools" / "svg2tvgt" / "bin" / "Debug" / "net8.0" / "svg2tvgt.dll")
 
+# Default zstd dictionary size (zstd CLI default = 112640 = 110KB)
+DICT_SIZE = 112640
+
+# Original TinyVG benchmark groups (have reference CSVs)
 BENCHMARK_CSVS = {
     "zig":             "https://raw.githubusercontent.com/TinyVG/website/main/src/benchmark/zig.csv",
     "w3c":             "https://raw.githubusercontent.com/TinyVG/website/main/src/benchmark/w3c.csv",
@@ -45,11 +48,20 @@ BENCHMARK_CSVS = {
     "freesvg":         "https://raw.githubusercontent.com/TinyVG/website/main/src/benchmark/freesvg.csv",
 }
 
+# All SVG directories (benchmark + new extended sets)
 SVG_DIRS = {
     "zig":             SVG_BASE / "zig-logo",
     "w3c":             SVG_BASE / "w3c",
     "material-design": SVG_BASE / "material-design",
     "papirus":         SVG_BASE / "papirus",
+    # Extended icon sets (no benchmark reference data)
+    "tabler":          SVG_BASE / "tabler",
+    "lucide":          SVG_BASE / "lucide",
+    "bootstrap":       SVG_BASE / "bootstrap",
+    "simple-icons":    SVG_BASE / "simple-icons",
+    "phosphor":        SVG_BASE / "phosphor",
+    "fontawesome":     SVG_BASE / "fontawesome",
+    "remixicon":       SVG_BASE / "remixicon",
 }
 
 PARALLEL_WORKERS = 8  # Number of parallel conversion workers
@@ -84,8 +96,19 @@ def download_benchmark_csv(group):
     return rows
 
 
+def enumerate_svgs(svg_dir):
+    """Enumerate SVGs from a directory, returning {basename: None} (no ref data)."""
+    rows = {}
+    if svg_dir.exists():
+        for f in svg_dir.iterdir():
+            if f.suffix.lower() == ".svg":
+                rows[f.name] = None
+    return rows
+
+
 def convert_one_svg_worker(args):
-    """Worker function for parallel conversion. Returns (basename, svg_size, tvg_bytes) or (basename, None, None)."""
+    """Worker function for parallel conversion.
+    Returns (basename, svgo_size, tvg_bytes) or (basename, None, None)."""
     svg_path, basename = args
     tmpdir = tempfile.mkdtemp(prefix="tvg-conv-")
     try:
@@ -99,6 +122,8 @@ def convert_one_svg_worker(args):
         if r.returncode != 0:
             return basename, None, None
 
+        svgo_size = file_size(opt_svg)
+
         # svg2tvgt
         r = run(["dotnet", SVG2TVGT_DLL, opt_svg, "--output", tvgt])
         if r.returncode != 0 or not os.path.isfile(tvgt):
@@ -109,15 +134,14 @@ def convert_one_svg_worker(args):
         if r.returncode != 0 or not os.path.isfile(tvg):
             return basename, None, None
 
-        svg_size = file_size(opt_svg)
         tvg_size = file_size(tvg)
-        if svg_size == 0 or tvg_size == 0:
+        if svgo_size == 0 or tvg_size == 0:
             return basename, None, None
 
         with open(tvg, "rb") as f:
             tvg_bytes = f.read()
 
-        return basename, svg_size, tvg_bytes
+        return basename, svgo_size, tvg_bytes
     except Exception:
         return basename, None, None
     finally:
@@ -139,7 +163,7 @@ def compress_brotli(inpath, outpath, quality=11):
     return file_size(outpath) if r.returncode == 0 else 0
 
 
-def train_zstd_dict(tvg_files, dict_path, maxdict=65536):
+def train_zstd_dict(tvg_files, dict_path, maxdict=DICT_SIZE):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for tvg in tvg_files:
             f.write(str(tvg) + "\n")
@@ -147,7 +171,7 @@ def train_zstd_dict(tvg_files, dict_path, maxdict=65536):
     try:
         cmd = ["zstd", "--train", f"--maxdict={maxdict}",
                f"--filelist={listfile}", "-o", str(dict_path)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         return r.returncode == 0 and os.path.isfile(dict_path)
     finally:
         os.unlink(listfile)
@@ -157,24 +181,26 @@ def train_zstd_dict(tvg_files, dict_path, maxdict=65536):
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def process_group(group_name, benchmark_data, svg_dir, tvg_output_dir):
-    """Process all files in a group using parallel workers."""
+def process_group(group_name, file_list, svg_dir, tvg_output_dir):
+    """Process all files in a group using parallel workers.
+    file_list: dict of {basename: (ref_svg, ref_tvg) or None}
+    """
     tvg_output_dir.mkdir(parents=True, exist_ok=True)
+    has_benchmark = group_name in BENCHMARK_CSVS
 
     # Build work items: (svg_path, basename)
     work_items = []
     missing = 0
-    # Build a case-insensitive index of the SVG dir
     svg_index = {}
     if svg_dir.exists():
         for f in svg_dir.iterdir():
             if f.suffix.lower() == ".svg":
+                svg_index[f.name] = f
                 svg_index[f.name.lower()] = f
 
-    for basename in benchmark_data:
-        svg_path = svg_dir / basename
-        if svg_path.exists():
-            work_items.append((str(svg_path), basename))
+    for basename in file_list:
+        if basename in svg_index:
+            work_items.append((str(svg_index[basename]), basename))
         elif basename.lower() in svg_index:
             work_items.append((str(svg_index[basename.lower()]), basename))
         else:
@@ -194,14 +220,22 @@ def process_group(group_name, benchmark_data, svg_dir, tvg_output_dir):
         futures = {executor.submit(convert_one_svg_worker, item): item for item in work_items}
         for future in as_completed(futures):
             done += 1
-            basename, svg_size, tvg_bytes = future.result()
+            basename, svgo_size, tvg_bytes = future.result()
             if tvg_bytes is None:
                 skipped += 1
             else:
-                ref_svg_size, ref_tvg_size = benchmark_data[basename]
                 tvg_path = tvg_output_dir / basename.replace(".svg", ".tvg")
                 with open(tvg_path, "wb") as f:
                     f.write(tvg_bytes)
+
+                ref_data = file_list[basename]
+                if ref_data is not None:
+                    ref_svg_size, ref_tvg_size = ref_data
+                else:
+                    # New group: use SVGO-optimized size as svg_size
+                    ref_svg_size = svgo_size
+                    ref_tvg_size = 0
+
                 results.append({
                     "group": group_name,
                     "file": basename,
@@ -212,10 +246,10 @@ def process_group(group_name, benchmark_data, svg_dir, tvg_output_dir):
                 })
                 converted += 1
 
-            if done % 100 == 0 or done == total:
+            if done % 200 == 0 or done == total:
                 print(f"  [{group_name}] {done}/{total}  (converted: {converted}, skipped: {skipped})")
 
-    print(f"  [{group_name}] Done: {converted} converted, {skipped} skipped out of {len(benchmark_data)}")
+    print(f"  [{group_name}] Done: {converted} converted, {skipped} skipped out of {len(file_list)}")
     return results
 
 
@@ -280,9 +314,14 @@ def main():
             if not svg_dir.exists():
                 print(f"  WARNING: SVG directory not found: {svg_dir}")
                 continue
-            benchmark = download_benchmark_csv(group_name)
+
+            if group_name in BENCHMARK_CSVS:
+                file_list = download_benchmark_csv(group_name)
+            else:
+                file_list = enumerate_svgs(svg_dir)
+
             group_tvg_dir = tvg_dir / group_name
-            results = process_group(group_name, benchmark, svg_dir, group_tvg_dir)
+            results = process_group(group_name, file_list, svg_dir, group_tvg_dir)
             all_results.extend(results)
 
         if not all_results:
@@ -305,7 +344,7 @@ def main():
             for p in [zstd_path, brotli_path]:
                 if os.path.exists(p):
                     os.unlink(p)
-            if (i + 1) % 200 == 0 or (i + 1) == len(all_results):
+            if (i + 1) % 500 == 0 or (i + 1) == len(all_results):
                 print(f"  Compressed {i+1}/{len(all_results)}")
 
         # Save cache
@@ -313,7 +352,7 @@ def main():
 
     # ---- Phase 3: Train zstd dictionary ----
     print("\n" + "=" * 60)
-    print("Phase 3: Training zstd dictionary on all TVG files")
+    print(f"Phase 3: Training zstd dictionary ({DICT_SIZE:,} bytes) on all TVG files")
     print("=" * 60)
 
     tvg_files = [Path(r["tvg_path"]) for r in all_results]
@@ -321,7 +360,7 @@ def main():
 
     if not train_zstd_dict(tvg_files, dict_path):
         print("WARNING: Dict training failed. Trying smaller size...")
-        if not train_zstd_dict(tvg_files, dict_path, maxdict=32768):
+        if not train_zstd_dict(tvg_files, dict_path, maxdict=65536):
             print("ERROR: Dictionary training failed entirely.")
             dict_path = None
 
@@ -334,7 +373,7 @@ def main():
             rec["zstd_dict_size"] = compress_zstd(tvg_path, zstd_dict_out, dict_path=dict_path)
             if os.path.exists(zstd_dict_out):
                 os.unlink(zstd_dict_out)
-            if (i + 1) % 200 == 0 or (i + 1) == len(all_results):
+            if (i + 1) % 500 == 0 or (i + 1) == len(all_results):
                 print(f"  Dict-compressed {i+1}/{len(all_results)}")
     else:
         for rec in all_results:
@@ -355,200 +394,9 @@ def main():
             writer.writerow({k: rec[k] for k in fieldnames})
     print(f"  CSV: {csv_path}")
 
-    # ---- Phase 5: Generate report ----
-    generate_report(all_results, dict_path)
-    print("\nDone! See results/ directory.")
-
-
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
-
-def pct(part, whole):
-    if whole == 0:
-        return "N/A"
-    return f"{100.0 * part / whole:.1f}%"
-
-
-def generate_report(all_results, dict_path):
-    report_path = RESULTS_DIR / "report.md"
-
-    groups = defaultdict(list)
-    for rec in all_results:
-        groups[rec["group"]].append(rec)
-
-    lines = []
-    lines.append("# TinyVG Compression Analysis Report")
-    lines.append("")
-    lines.append("This report extends the [TinyVG benchmark](https://tinyvg.tech/) by measuring")
-    lines.append("the additional compression achievable on `.tvg` (TinyVG binary) files using")
-    lines.append("modern general-purpose compressors.")
-    lines.append("")
-    lines.append("## Methodology")
-    lines.append("")
-    lines.append("- **Source SVGs**: Drawn from the same public datasets used by the official")
-    lines.append("  TinyVG benchmark: Zig logos, W3C SVG samples, Material Design icons, and")
-    lines.append("  Papirus icons. (5 FreeSVG.org files omitted as no longer retrievable from source.)")
-    lines.append("- **SVG optimization**: Each SVG is first optimized with SVGO (multipass, precision 3)")
-    lines.append("  matching the original benchmark pipeline. SVG sizes in the tables below are the")
-    lines.append("  SVGO-optimized sizes from the official benchmark data.")
-    lines.append("- **SVG -> TVG conversion**: `svg2tvgt` (SVG to TinyVG text) then `tvg-text`")
-    lines.append("  (TinyVG text to binary), from the TinyVG SDK.")
-    lines.append("- **Compression**:")
-    lines.append("  - **zstd -22**: `zstd --ultra -22` (maximum compression level)")
-    lines.append("  - **brotli -11**: `brotli -q 11` (maximum quality)")
-    lines.append("  - **zstd -22 +dict**: A custom dictionary trained on all TVG files via")
-    lines.append("    `zstd --train --maxdict=65536`, then compressed with `zstd --ultra -22 -D dict`")
-    lines.append("")
-    lines.append("All sizes are in bytes. \"% of SVG\" = compressed size / SVGO-optimized SVG size.")
-    lines.append("\"% of TVG\" = compressed size / uncompressed TVG size.")
-    lines.append("")
-
-    if dict_path and dict_path.exists():
-        lines.append(f"**Trained zstd dictionary size**: {file_size(dict_path):,} bytes")
-        lines.append("")
-
-    # ---- Overall ----
-    lines.append("## Overall Summary")
-    lines.append("")
-
-    total_svg = sum(r["svg_size"] for r in all_results)
-    total_tvg = sum(r["tvg_size"] for r in all_results)
-    total_zstd = sum(r["zstd_size"] for r in all_results)
-    total_brotli = sum(r["brotli_size"] for r in all_results)
-    total_zstd_dict = sum(r["zstd_dict_size"] for r in all_results)
-    n = len(all_results)
-
-    lines.append(f"| Metric | Total bytes | % of SVG | % of TVG |")
-    lines.append(f"|--------|------------|----------|----------|")
-    lines.append(f"| **SVG (SVGO-optimized)** | {total_svg:,} | 100.0% | - |")
-    lines.append(f"| **TVG (uncompressed)** | {total_tvg:,} | {pct(total_tvg, total_svg)} | 100.0% |")
-    lines.append(f"| **TVG + zstd -22** | {total_zstd:,} | {pct(total_zstd, total_svg)} | {pct(total_zstd, total_tvg)} |")
-    lines.append(f"| **TVG + brotli -11** | {total_brotli:,} | {pct(total_brotli, total_svg)} | {pct(total_brotli, total_tvg)} |")
-    lines.append(f"| **TVG + zstd -22 +dict** | {total_zstd_dict:,} | {pct(total_zstd_dict, total_svg)} | {pct(total_zstd_dict, total_tvg)} |")
-    lines.append("")
-    lines.append(f"*{n} files analyzed across {len(groups)} dataset groups.*")
-    lines.append("")
-
-    # Median per-file ratios
-    def median(vals):
-        s = sorted(vals)
-        n = len(s)
-        if n == 0:
-            return 0
-        return s[n // 2] if n % 2 == 1 else (s[n//2 - 1] + s[n//2]) / 2
-
-    tvg_pcts = [r["tvg_size"] / r["svg_size"] * 100 for r in all_results if r["svg_size"] > 0]
-    zstd_pcts = [r["zstd_size"] / r["svg_size"] * 100 for r in all_results if r["svg_size"] > 0]
-    brotli_pcts = [r["brotli_size"] / r["svg_size"] * 100 for r in all_results if r["svg_size"] > 0]
-    dict_pcts = [r["zstd_dict_size"] / r["svg_size"] * 100 for r in all_results if r["svg_size"] > 0]
-
-    lines.append("### Median per-file compression ratios (% of SVG)")
-    lines.append("")
-    lines.append(f"| Metric | Median % of SVG |")
-    lines.append(f"|--------|----------------|")
-    lines.append(f"| TVG | {median(tvg_pcts):.1f}% |")
-    lines.append(f"| TVG + zstd -22 | {median(zstd_pcts):.1f}% |")
-    lines.append(f"| TVG + brotli -11 | {median(brotli_pcts):.1f}% |")
-    lines.append(f"| TVG + zstd -22 +dict | {median(dict_pcts):.1f}% |")
-    lines.append("")
-
-    # ---- Per-group ----
-    lines.append("## Per-Group Summary")
-    lines.append("")
-
-    group_order = ["zig", "w3c", "material-design", "papirus"]
-    for gname in group_order:
-        if gname not in groups:
-            continue
-        grecs = groups[gname]
-        g_svg = sum(r["svg_size"] for r in grecs)
-        g_tvg = sum(r["tvg_size"] for r in grecs)
-        g_zstd = sum(r["zstd_size"] for r in grecs)
-        g_brotli = sum(r["brotli_size"] for r in grecs)
-        g_zstd_dict = sum(r["zstd_dict_size"] for r in grecs)
-
-        lines.append(f"### {gname} ({len(grecs)} files)")
-        lines.append("")
-        lines.append(f"| Metric | Total bytes | % of SVG | % of TVG |")
-        lines.append(f"|--------|------------|----------|----------|")
-        lines.append(f"| SVG (optimized) | {g_svg:,} | 100.0% | - |")
-        lines.append(f"| TVG | {g_tvg:,} | {pct(g_tvg, g_svg)} | 100.0% |")
-        lines.append(f"| TVG + zstd -22 | {g_zstd:,} | {pct(g_zstd, g_svg)} | {pct(g_zstd, g_tvg)} |")
-        lines.append(f"| TVG + brotli -11 | {g_brotli:,} | {pct(g_brotli, g_svg)} | {pct(g_brotli, g_tvg)} |")
-        lines.append(f"| TVG + zstd -22 +dict | {g_zstd_dict:,} | {pct(g_zstd_dict, g_svg)} | {pct(g_zstd_dict, g_tvg)} |")
-        lines.append("")
-
-    # ---- Per-file detail ----
-    lines.append("## Per-File Details")
-    lines.append("")
-    lines.append("Full per-file data is in `compression_data.csv`. Below are highlights per group.")
-    lines.append("")
-
-    for gname in group_order:
-        if gname not in groups:
-            continue
-        grecs = sorted(groups[gname], key=lambda r: r["svg_size"], reverse=True)
-
-        lines.append(f"### {gname}")
-        lines.append("")
-        lines.append("| File | SVG | TVG | zstd | brotli | zstd+dict | TVG/SVG | zstd/SVG | brotli/SVG | dict/SVG |")
-        lines.append("|------|-----|-----|------|--------|-----------|---------|----------|------------|----------|")
-
-        if len(grecs) <= 30:
-            show = grecs
-        else:
-            show = grecs[:10] + [None] + grecs[-10:]
-
-        for rec in show:
-            if rec is None:
-                lines.append(f"| ... | ... | ... | ... | ... | ... | ... | ... | ... | ... |")
-                continue
-            lines.append(
-                f"| {rec['file'][:45]} "
-                f"| {rec['svg_size']:,} "
-                f"| {rec['tvg_size']:,} "
-                f"| {rec['zstd_size']:,} "
-                f"| {rec['brotli_size']:,} "
-                f"| {rec['zstd_dict_size']:,} "
-                f"| {pct(rec['tvg_size'], rec['svg_size'])} "
-                f"| {pct(rec['zstd_size'], rec['svg_size'])} "
-                f"| {pct(rec['brotli_size'], rec['svg_size'])} "
-                f"| {pct(rec['zstd_dict_size'], rec['svg_size'])} |"
-            )
-        lines.append("")
-
-    # ---- Best overall compression ----
-    lines.append("## Top 20 Best Compression Ratios (zstd+dict as % of SVG)")
-    lines.append("")
-    sorted_by_ratio = sorted(all_results,
-                             key=lambda r: r["zstd_dict_size"] / r["svg_size"] if r["svg_size"] > 0 else 1)
-    lines.append("| File | Group | SVG | TVG | zstd+dict | % of SVG |")
-    lines.append("|------|-------|-----|-----|-----------|----------|")
-    for rec in sorted_by_ratio[:20]:
-        lines.append(
-            f"| {rec['file'][:45]} | {rec['group']} "
-            f"| {rec['svg_size']:,} | {rec['tvg_size']:,} "
-            f"| {rec['zstd_dict_size']:,} | {pct(rec['zstd_dict_size'], rec['svg_size'])} |"
-        )
-    lines.append("")
-
-    # ---- Worst compression ----
-    lines.append("## Bottom 20 Worst Compression Ratios (zstd+dict as % of SVG)")
-    lines.append("")
-    lines.append("| File | Group | SVG | TVG | zstd+dict | % of SVG |")
-    lines.append("|------|-------|-----|-----|-----------|----------|")
-    for rec in sorted_by_ratio[-20:]:
-        lines.append(
-            f"| {rec['file'][:45]} | {rec['group']} "
-            f"| {rec['svg_size']:,} | {rec['tvg_size']:,} "
-            f"| {rec['zstd_dict_size']:,} | {pct(rec['zstd_dict_size'], rec['svg_size'])} |"
-        )
-    lines.append("")
-
-    with open(report_path, "w") as f:
-        f.write("\n".join(lines))
-    print(f"  Report: {report_path}")
+    print(f"\nDone! {len(all_results)} files processed. See results/ directory.")
+    print("Now run: python3 diagnose_failures.py  (for failure analysis)")
+    print("  then: python3 generate_report.py     (for final report)")
 
 
 if __name__ == "__main__":
